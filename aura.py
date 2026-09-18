@@ -17,8 +17,8 @@ KEYWORDS = {
 }
 
 MULTI_OPS = [
-    '..=','...','..','<-','==','!=','<=','>=','&&','||',':=','->',
-    '+=','-=','*=','/=','%=','++','--'
+    '<<=','>>=','..=','...','..','<-','==','!=','<=','>=','&&','||',':=','->',
+    '+=','-=','*=','/=','%=','&=','|=','^=','<<','>>','++','--'
 ]
 
 
@@ -75,6 +75,12 @@ class Lexer:
 
     def _num(self) -> str:
         s, dot = '', False
+        if self._peek() == '0' and self._peek(1) in ('x', 'X'):
+            s += self._adv() + self._adv()
+            while self.pos < len(self.src) and (self._peek().isdigit() or self._peek().lower() in 'abcdef' or self._peek() == '_'):
+                c = self._adv()
+                if c != '_': s += c
+            return s
         while self.pos < len(self.src):
             c = self._peek()
             if c.isdigit(): s += self._adv()
@@ -285,8 +291,8 @@ class TryExpr(Node):
 # 3 — PARSER
 # ═══════════════════════════════════════════════════════════════════════════
 
-PRIMITIVES = {'int','float','bool','string','void'}
-COMPOUND_OPS = {'+=','-=','*=','/=','%='}
+PRIMITIVES = {'int','float','bool','string','void','u8','u16','u32','u64','i8','i16','i32','i64','byte','char'}
+COMPOUND_OPS = {'+=','-=','*=','/=','%=','&=','|=','^=','<<=','>>='}
 
 
 class Parser:
@@ -566,9 +572,24 @@ class Parser:
             t = self._eat('||'); l = BinaryExpr('||', l, self._and(), t.line)
         return l
     def _and(self) -> Node:
-        l = self._eq()
+        l = self._bitor()
         while self._at('&&'):
-            t = self._eat('&&'); l = BinaryExpr('&&', l, self._eq(), t.line)
+            t = self._eat('&&'); l = BinaryExpr('&&', l, self._bitor(), t.line)
+        return l
+    def _bitor(self) -> Node:
+        l = self._bitxor()
+        while self._at('|'):
+            t = self._eat('|'); l = BinaryExpr('|', l, self._bitxor(), t.line)
+        return l
+    def _bitxor(self) -> Node:
+        l = self._bitand()
+        while self._at('^'):
+            t = self._eat('^'); l = BinaryExpr('^', l, self._bitand(), t.line)
+        return l
+    def _bitand(self) -> Node:
+        l = self._eq()
+        while self._at('&'):
+            t = self._eat('&'); l = BinaryExpr('&', l, self._eq(), t.line)
         return l
     def _eq(self) -> Node:
         l = self._cmp()
@@ -577,8 +598,14 @@ class Parser:
             l = BinaryExpr(t.kind, l, self._cmp(), t.line)
         return l
     def _cmp(self) -> Node:
-        l = self._add()
+        l = self._shift()
         while self._at('<') or self._at('>') or self._at('<=') or self._at('>=') or self._at('in'):
+            t = self._peek(); self.i += 1
+            l = BinaryExpr(t.kind, l, self._shift(), t.line)
+        return l
+    def _shift(self) -> Node:
+        l = self._add()
+        while self._at('<<') or self._at('>>'):
             t = self._peek(); self.i += 1
             l = BinaryExpr(t.kind, l, self._add(), t.line)
         return l
@@ -597,7 +624,7 @@ class Parser:
         return l
     def _unary(self) -> Node:
         t = self._peek()
-        if t.kind in ('!','-','*','&'):
+        if t.kind in ('!','-','*','&','~'):
             self.i += 1
             return UnaryExpr(t.kind, self._unary(), t.line)
         if t.kind == '<-':
@@ -624,7 +651,9 @@ class Parser:
                 e = MemberAccess(e, f, ln)
             elif self._at('['):
                 ln = self._peek().line
-                self._eat('['); idx = self.parse_expr(); self._eat(']')
+                self._eat('[')
+                idx = self._parse_range_or_expr()
+                self._eat(']')
                 e = IndexExpr(e, idx, ln)
             elif self._at('?'):
                 ln = self._peek().line
@@ -640,7 +669,7 @@ class Parser:
 
     def _primary(self) -> Node:
         t = self._peek()
-        if t.kind == 'NUMBER': self._eat('NUMBER'); return IntLit(int(t.value), t.line)
+        if t.kind == 'NUMBER': self._eat('NUMBER'); return IntLit(int(t.value, 0), t.line)
         if t.kind == 'FLOAT':  self._eat('FLOAT');  return FloatLit(float(t.value), t.line)
         if t.kind == 'STRING': self._eat('STRING'); return StringLit(t.value, t.line)
         if t.kind in ('true','false'):
@@ -711,6 +740,17 @@ class Analyzer:
         self.functions: Dict[str, FuncDecl] = {}
         self.extern_funcs: set = set()
         self.structs: Dict[str, Dict[str, Tuple]] = {}
+
+        # Register standard library builtins
+        builtins = [
+            FuncDecl('aura_read_file', [Param('path', TypeRef('string'))], TypeRef('string'), None, is_extern=True),
+            FuncDecl('aura_write_file', [Param('path', TypeRef('string')), Param('content', TypeRef('string'))], TypeRef('bool'), None, is_extern=True),
+            FuncDecl('aura_now_ms', [], TypeRef('int'), None, is_extern=True),
+            FuncDecl('aura_sleep_ms', [Param('ms', TypeRef('int'))], None, None, is_extern=True),
+        ]
+        for f in builtins:
+            self.functions[f.name] = f
+            self.extern_funcs.add(f.name)
         self.struct_order: Dict[str, List[str]] = {}
         self.enums: Dict[str, Dict[str, List[Tuple]]] = {}
         self.consts: Dict[str, Tuple] = {}
@@ -803,7 +843,7 @@ class Analyzer:
             it = self._analyze_expr(s.init) if s.init else None
             dt = self._resolve(s.type) if s.type else it
             if dt is None: self._err(s.line, f"'{s.name}' declared without type or initializer")
-            if it and not self._type_eq(dt, it) and not (dt == ('float',) and it == ('int',)):
+            if it and not self._type_eq(dt, it) and not (dt == ('float',) and it == ('int',)) and not (self._is_int_type(dt) and self._is_int_type(it)):
                 self._err(s.line, f"type mismatch for '{s.name}': {dt} vs {it}")
             self.scope.define(s.name, dt, self._is_arc(dt))
             s._resolved_type = dt
@@ -891,6 +931,9 @@ class Analyzer:
         if isinstance(s, (BreakStmt, ContinueStmt)): return
         self._err(getattr(s,'line',0), f"unhandled statement {type(s).__name__}")
 
+    def _is_int_type(self, t: Tuple) -> bool:
+        return t[0] in ('int','u8','u16','u32','u64','i8','i16','i32','i64','byte','char')
+
     def _type_eq(self, a: Tuple, b: Tuple) -> bool: return a == b
 
     def _analyze_expr(self, e: Node) -> Tuple:
@@ -919,6 +962,7 @@ class Analyzer:
                 if e.op in ('==','!=') and lt == ('string',) and rt == ('string',): return ('bool',)
                 return ('bool',)
             if e.op in ('&&','||'): return ('bool',)
+            if e.op in ('&', '|', '^', '<<', '>>'): return lt
             if e.op == '+':
                 if lt == ('string',) and rt == ('string',): return ('string',)
                 if lt[0] == 'ptr' and rt == ('int',): return lt
@@ -932,7 +976,7 @@ class Analyzer:
         if isinstance(e, UnaryExpr):
             t = self._analyze_expr(e.operand)
             if e.op == '!': return ('bool',)
-            if e.op == '-': return t
+            if e.op in ('-', '~'): return t
             if e.op == '&': return ('ptr', t)
             if e.op == '*':
                 if t[0] != 'ptr': self._err(e.line, f"'*' dereference needs pointer, got {t}")
@@ -948,8 +992,27 @@ class Analyzer:
             return tt
 
         if isinstance(e, CallExpr):
-            # Universal Method Resolution
+            # Universal Method Resolution & Enum Construction
             if isinstance(e.func, MemberAccess):
+                if isinstance(e.func.obj, Ident) and e.func.obj.name in self.enums:
+                    self._analyze_expr(e.func)
+                    if getattr(e.func, '_is_enum_ctor', False):
+                        ename = e.func._enum_name
+                        vname = e.func._variant_name
+                        vtypes = e.func._variant_types
+                        if len(e.args) != len(vtypes):
+                            self._err(e.line, f"enum variant '{ename}.{vname}' expects {len(vtypes)} arguments, got {len(e.args)}")
+                        for a, vt in zip(e.args, vtypes):
+                            at = self._analyze_expr(a)
+                            if not self._type_eq(vt, at) and not (vt == ('float',) and at == ('int',)):
+                                self._err(e.line, f"type mismatch in '{ename}.{vname}': expected {vt}, got {at}")
+                        e._is_enum_ctor_call = True
+                        e._enum_name = ename
+                        e._variant_name = vname
+                        e._variant_tag = e.func._variant_tag
+                        e._variant_types = vtypes
+                        return ('enum', ename)
+
                 base_t = self._analyze_expr(e.func.obj)
                 st = None
                 if base_t[0] == 'struct': st = base_t[1]
@@ -1005,7 +1068,44 @@ class Analyzer:
             return ('map', kt, vt)
 
         if isinstance(e, MemberAccess):
+            if isinstance(e.obj, Ident) and e.obj.name in self.enums:
+                ename = e.obj.name
+                if e.field in self.enums[ename]:
+                    vtypes = self.enums[ename][e.field]
+                    tag_idx = list(self.enums[ename].keys()).index(e.field)
+                    if len(vtypes) == 0:
+                        e._is_enum_variant = True
+                        e._enum_name = ename
+                        e._variant_name = e.field
+                        e._variant_tag = tag_idx
+                        return ('enum', ename)
+                    else:
+                        e._is_enum_ctor = True
+                        e._enum_name = ename
+                        e._variant_name = e.field
+                        e._variant_tag = tag_idx
+                        e._variant_types = vtypes
+                        return ('enum_ctor', ename, e.field)
+                self._err(e.line, f"enum '{ename}' has no variant '{e.field}'")
+
             ot = self._analyze_expr(e.obj)
+            if ot[0] == 'enum':
+                if e.field == 'tag':
+                    e._is_enum_tag_access = True
+                    return ('int',)
+                self._err(e.line, f"enum '{ot[1]}' has no field '{e.field}'")
+            if ot[0] == 'result':
+                if e.field == 'ok':
+                    e._is_result_access = True
+                    return ('bool',)
+                if e.field == 'val':
+                    e._is_result_access = True
+                    return ot[1]
+                if e.field == 'err_code':
+                    e._is_result_access = True
+                    return ('int',)
+                self._err(e.line, f"result has no field '{e.field}'")
+
             st = ot[1][1] if (ot[0] == 'ptr' and ot[1][0] == 'struct') else (ot[1] if ot[0] == 'struct' else None)
             if not st or st not in self.structs: self._err(e.line, f"member access '.{e.field}' on non-struct {ot}")
             t = self.structs[st][e.field]
@@ -1013,7 +1113,14 @@ class Analyzer:
             return t
 
         if isinstance(e, IndexExpr):
-            ot = self._analyze_expr(e.obj); it = self._analyze_expr(e.index)
+            ot = self._analyze_expr(e.obj)
+            if isinstance(e.index, RangeExpr):
+                self._analyze_expr(e.index.lo)
+                self._analyze_expr(e.index.hi)
+                e._is_slice_range = True
+                e._resolved_type = ot
+                return ot
+            it = self._analyze_expr(e.index)
             if ot[0] == 'slice': e._resolved_type = ot[1]; return ot[1]
             if ot[0] == 'ptr':   e._resolved_type = ot[1]; return ot[1]
             if ot[0] == 'map':
@@ -1060,6 +1167,8 @@ class Analyzer:
 RUNTIME_HEADER = r'''
 #ifndef AURA_RT_H
 #define AURA_RT_H
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -1134,6 +1243,10 @@ static inline AuraString* aura_string_new(const char* s) {
     AuraString* o = (AuraString*)aura_alloc(sizeof(AuraString) + n + 1);
     o->len = n; memcpy(o->data, s, n); o->data[n] = '\0'; return o;
 }
+static inline AuraString* aura_string_new_len(const char* s, size_t n) {
+    AuraString* o = (AuraString*)aura_alloc(sizeof(AuraString) + n + 1);
+    o->len = n; memcpy(o->data, s, n); o->data[n] = '\0'; return o;
+}
 static inline AuraString* aura_string_concat(AuraString* a, AuraString* b) {
     size_t n = a->len + b->len;
     AuraString* o = (AuraString*)aura_alloc(sizeof(AuraString) + n + 1);
@@ -1182,8 +1295,13 @@ static inline void aura_map_set(AuraMap* m, int64_t k, int64_t v) {
         m->entries = (AuraMapEntry*)calloc(m->cap, sizeof(AuraMapEntry));
         m->count = 0;
         for (size_t i = 0; i < old_cap; i++) {
-            if (old_entries[i].occupied)
-                aura_map_set(m, old_entries[i].key, old_entries[i].val);
+            if (old_entries[i].occupied) {
+                // Re-insert without extra retaining (move entries)
+                uint64_t idx = aura_hash_key(old_entries[i].key, m->is_str_key) & (m->cap - 1);
+                while (m->entries[idx].occupied) idx = (idx + 1) & (m->cap - 1);
+                m->entries[idx] = old_entries[i];
+                m->count++;
+            }
         }
         free(old_entries);
     }
@@ -1194,8 +1312,40 @@ static inline void aura_map_set(AuraMap* m, int64_t k, int64_t v) {
         } else if (m->entries[idx].key == k) break;
         idx = (idx + 1) & (m->cap - 1);
     }
-    if (!m->entries[idx].occupied) { m->count++; m->entries[idx].occupied = true; }
+    if (!m->entries[idx].occupied) {
+        m->count++; m->entries[idx].occupied = true;
+        if (m->is_str_key) aura_retain((void*)k);
+    } else {
+        if (m->is_str_val) aura_release((void*)m->entries[idx].val);
+    }
+    if (m->is_str_val) aura_retain((void*)v);
     m->entries[idx].key = k; m->entries[idx].val = v;
+}
+static inline void aura_map_free(AuraMap* m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->entries[i].occupied) {
+            if (m->is_str_key) aura_release((void*)m->entries[i].key);
+            if (m->is_str_val) aura_release((void*)m->entries[i].val);
+        }
+    }
+    free(m->entries);
+}
+static inline void aura_release_map(void* p) {
+    if (!p) return;
+    AuraHeader* h = (AuraHeader*)p - 1;
+    if (h->flags & 1) return;
+    if (atomic_fetch_sub_explicit(&h->rc, 1, memory_order_acq_rel) == 1) {
+        aura_map_free((AuraMap*)p); free(h);
+    }
+}
+static inline void aura_release_map_local(void* p) {
+    if (!p) return;
+    AuraHeader* h = (AuraHeader*)p - 1;
+    if (h->flags & 1) return;
+    if (--h->rc == 0) {
+        aura_map_free((AuraMap*)p); free(h);
+    }
 }
 static inline int64_t aura_map_get(AuraMap* m, int64_t k) {
     uint64_t idx = aura_hash_key(k, m->is_str_key) & (m->cap - 1);
@@ -1438,7 +1588,7 @@ class CCodegen:
         for n, k in self.arc_stack[-1]:
             if k == 'string': self._w(f"aura_release_local({n});")
             elif k == 'slice': self._w(f"aura_release_local(({n}).data);")
-            elif k == 'map':   self._w(f"aura_release_local({n});")
+            elif k == 'map':   self._w(f"aura_release_map_local({n});")
         self.arc_stack.pop()
         self.var_types = self.scope_stack.pop()
 
@@ -1450,11 +1600,18 @@ class CCodegen:
     def ctype(self, t: Tuple) -> str:
         if t is None: return 'void'
         k = t[0]
-        if k == 'int':    return 'int64_t'
+        if k in ('int', 'i64'): return 'int64_t'
         if k == 'float':  return 'double'
         if k == 'bool':   return 'bool'
         if k == 'string': return 'AuraString*'
         if k == 'void':   return 'void'
+        if k in ('u8', 'byte', 'char'): return 'uint8_t'
+        if k == 'u16':    return 'uint16_t'
+        if k == 'u32':    return 'uint32_t'
+        if k == 'u64':    return 'uint64_t'
+        if k == 'i8':     return 'int8_t'
+        if k == 'i16':    return 'int16_t'
+        if k == 'i32':    return 'int32_t'
         if k == 'ptr':    return self.ctype(t[1]) + '*'
         if k == 'chan':   return 'AuraChan*'
         if k == 'slice':  return 'AuraSlice'
@@ -1478,9 +1635,11 @@ class CCodegen:
             elif isinstance(d, ExternBlock):
                 for f in d.decls: self._emit_sig(f, forward=True, extern=True)
         self._w()
+        func_start_idx = len(self.out)
         for d in prog.decls:
             if isinstance(d, FuncDecl) and not d.is_extern: self._emit_func(d)
-        for h in self.spawn_helpers: self.out.append(h)
+        for h in reversed(self.spawn_helpers):
+            self.out.insert(func_start_idx, h)
         return '\n'.join(self.out)
 
     def _emit_struct(self, d: StructDecl):
@@ -1502,7 +1661,7 @@ class CCodegen:
         self.indent += 1
         for vn, vt in d.variants:
             if vt:
-                parts = [f"{self.ctype(t)} _{i};" for i, t in enumerate(vt)]
+                parts = [f"{self.ctype(self.an._resolve(t))} _{i};" for i, t in enumerate(vt)]
                 self._w(f"struct {{ {' '.join(parts)} }} {vn};")
         self.indent -= 1
         self._w("} data;")
@@ -1597,6 +1756,20 @@ class CCodegen:
         if isinstance(e, (Ident, MemberAccess, IndexExpr)): return True
         return False
 
+    def _get_unwind_code(self) -> str:
+        old_out = self.out
+        self.out = []
+        for dlist in reversed(self.defer_stack):
+            for d in reversed(dlist): self._emit_stmt(d)
+        for sc in reversed(self.arc_stack):
+            for n, k in sc:
+                if k == 'string': self._w(f"aura_release_local({n});")
+                elif k == 'slice': self._w(f"aura_release_local(({n}).data);")
+                elif k == 'map':   self._w(f"aura_release_map_local({n});")
+        unwind_lines = self.out
+        self.out = old_out
+        return " ".join(line.strip() for line in unwind_lines)
+
     def _emit_return(self, s: ReturnStmt):
         # Precise Return: Evaluate, conditionally retain, unwind defers & ARC, return
         if s.value is None:
@@ -1631,7 +1804,7 @@ class CCodegen:
             for n, k in sc:
                 if k == 'string': self._w(f"aura_release_local({n});")
                 elif k == 'slice': self._w(f"aura_release_local(({n}).data);")
-                elif k == 'map':   self._w(f"aura_release_local({n});")
+                elif k == 'map':   self._w(f"aura_release_map_local({n});")
 
         self._w(f"return {tmp};")
 
@@ -1735,11 +1908,18 @@ class CCodegen:
         fname = call.func.name
         self.spawn_n += 1
         sid = self.spawn_n
+        fn_decl = self.an.functions.get(fname)
         arg_exprs = [self._emit_expr(a) for a in call.args]
         sname = f"__aura_spawn_args_{sid}"
         tname = f"__aura_spawn_tramp_{sid}"
         lines = ["typedef struct {"]
-        for i, a in enumerate(arg_exprs): lines.append(f"    __typeof__({a}) a{i};")
+        if fn_decl and fn_decl.params:
+            for i, p in enumerate(fn_decl.params):
+                pt = self.ctype(self.an._resolve(p.type))
+                lines.append(f"    {pt} a{i};")
+        else:
+            for i, a in enumerate(arg_exprs):
+                lines.append(f"    int64_t a{i};")
         lines.append(f"}} {sname};")
         body = [f"static void* {tname}(void* __p) {{", f"    {sname}* __a = ({sname}*)__p;"]
         args_str = ', '.join(f"__a->a{i}" for i in range(len(arg_exprs)))
@@ -1761,9 +1941,16 @@ class CCodegen:
         if isinstance(e, StringLit): return ('string',)
         if isinstance(e, NilLit):    return ('ptr', ('void',))
         if isinstance(e, Ident):     return self.var_types.get(e.name, ('int',))
-        if isinstance(e, CallExpr):  return getattr(e, '_resolved_ret', ('int',))
+        if isinstance(e, CallExpr):
+            if getattr(e, '_is_enum_ctor_call', False): return ('enum', getattr(e, '_enum_name'))
+            intr = getattr(e, '_intrinsic', None)
+            if intr in ('ok', 'err'): return ('result', ('void',), ('int',))
+            return getattr(e, '_resolved_ret', ('int',))
         if isinstance(e, ChanRecv):  return getattr(e, '_resolved_type', ('int',))
-        if isinstance(e, MemberAccess): return getattr(e, '_resolved_type', ('int',))
+        if isinstance(e, MemberAccess):
+            if getattr(e, '_is_enum_variant', False): return ('enum', getattr(e, '_enum_name'))
+            if getattr(e, '_is_enum_tag_access', False): return ('int',)
+            return getattr(e, '_resolved_type', ('int',))
         if isinstance(e, IndexExpr): return getattr(e, '_resolved_type', ('int',))
         if isinstance(e, SliceLit):  return ('slice', getattr(e, '_elem_type', ('int',)))
         if isinstance(e, StructLit): return ('struct', e.name)
@@ -1836,6 +2023,18 @@ class CCodegen:
             return f"({tgt_c} {op}= {val_c})"
 
         if isinstance(e, CallExpr):
+            if getattr(e, '_is_enum_ctor_call', False):
+                ename = e._enum_name
+                vname = e._variant_name
+                tag = e._variant_tag
+                args_c = [self._emit_expr(a) for a in e.args]
+                if args_c:
+                    inits = ", ".join(f"._{i} = {arg}" for i, arg in enumerate(args_c))
+                    data_init = f", .data.{vname} = {{ {inits} }}"
+                else:
+                    data_init = ""
+                return f"((Aura_{ename}){{ .tag = {tag}{data_init} }})"
+
             intr = getattr(e, '_intrinsic', None)
             if intr in ('print','println'):
                 a = e.args[0]; t = self._infer(a); c = self._emit_expr(a)
@@ -1891,13 +2090,34 @@ class CCodegen:
             return f"aura_map_new({sk}, {sv})"
 
         if isinstance(e, MemberAccess):
+            if getattr(e, '_is_enum_variant', False):
+                ename = e._enum_name
+                tag = e._variant_tag
+                return f"((Aura_{ename}){{ .tag = {tag} }})"
+            if getattr(e, '_is_enum_tag_access', False):
+                obj = self._emit_expr(e.obj)
+                return f"({obj}).tag"
+            if getattr(e, '_is_result_access', False):
+                obj = self._emit_expr(e.obj)
+                if e.field == 'val':
+                    val_type = getattr(e, '_resolved_type', ('int',))
+                    ct = self.ctype(val_type)
+                    return f"(({ct})({obj}).val.i)"
+                return f"({obj}).{e.field}"
             obj = self._emit_expr(e.obj); ot = self._infer(e.obj)
             op = '->' if (ot[0] == 'ptr' and ot[1][0] == 'struct') else '.'
             return f"({obj}){op}{e.field}"
 
         if isinstance(e, IndexExpr):
-            obj = self._emit_expr(e.obj); idx = self._emit_expr(e.index)
+            obj = self._emit_expr(e.obj)
             ot = self._infer(e.obj)
+            if getattr(e, '_is_slice_range', False):
+                lo = self._emit_expr(e.index.lo)
+                hi = self._emit_expr(e.index.hi)
+                if ot == ('string',):
+                    return f"aura_string_new_len(({obj})->data + ({lo}), ({hi}) - ({lo}))"
+                return f"((AuraSlice){{ .data = (char*)(({obj}).data) + ({lo}), .len = ({hi}) - ({lo}), .cap = (({obj}).cap) - ({lo}) }})"
+            idx = self._emit_expr(e.index)
             if ot[0] == 'slice':
                 ct = self.ctype(getattr(e, '_resolved_type', ('int',)))
                 return f"(({ct}*)(({obj}).data))[{idx}]"
@@ -1925,8 +2145,9 @@ class CCodegen:
             res = self._fresh('res')
             ct = self.ctype(getattr(e, '_resolved_type', ('int',)))
             call_c = self._emit_expr(e.expr)
+            unwind = self._get_unwind_code()
             return (f"({{ AuraResult {res} = {call_c}; "
-                    f"if (!{res}.ok) return {res}; "
+                    f"if (!{res}.ok) {{ {unwind} return {res}; }} "
                     f"({ct}){res}.val.i; }})")
 
         raise RuntimeError(f"codegen expr {type(e).__name__}")

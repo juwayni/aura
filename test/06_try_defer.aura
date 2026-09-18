@@ -1,0 +1,18 @@
+func failing_fn() result[int, int] {
+    return err(404)
+}
+
+func test_try() result[int, int] {
+    let s = "allocated_string_res"
+    defer print("defer in try block executed")
+    let val = failing_fn()?
+    return ok(val)
+}
+
+func main() int {
+    let res = test_try()
+    if !res.ok {
+        print("caught error")
+    }
+    return 0
+}
