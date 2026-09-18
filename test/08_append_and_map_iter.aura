@@ -1,0 +1,21 @@
+func main() int {
+    let buf = []int{}
+    for i = 1; i <= 10; i++ {
+        buf = append(buf, i * 10)
+    }
+
+    print(len(buf))             // 10
+    print(buf[0])               // 10
+    print(buf[9])               // 100
+
+    let m = make(map[string]int)
+    m["apple"] = 5
+    m["banana"] = 12
+
+    let total = 0
+    for k, v in m {
+        total += v
+    }
+    print(total)                // 17
+    return 0
+}

@@ -1,0 +1,43 @@
+interface Widget {
+    func paint() int
+}
+
+struct Button {
+    label string
+}
+
+func (b Button) paint() int {
+    print("paint button:")
+    print(b.label)
+    return 0
+}
+
+struct Image {
+    url string
+}
+
+func (i Image) paint() int {
+    print("paint image:")
+    print(i.url)
+    return 0
+}
+
+func render(w Widget) int {
+    w.paint()
+    return 0
+}
+
+func main() int {
+    let b = Button{ label: "Click Me" }
+    let img = Image{ url: "logo.png" }
+
+    render(b)
+    render(img)
+
+    let widgets = []Widget{ b, img }
+    for w in widgets {
+        w.paint()
+    }
+
+    return 0
+}

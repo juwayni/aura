@@ -13,11 +13,12 @@ from typing import Optional, List, Dict, Tuple, Any
 KEYWORDS = {
     'let','const','func','return','if','else','for','spawn','chan',
     'arena','extern','true','false','nil','import','type','struct',
-    'break','continue','make','as','in','result','defer','enum','map'
+    'break','continue','make','as','in','result','defer','enum','map',
+    'match','case','interface','weak'
 }
 
 MULTI_OPS = [
-    '<<=','>>=','..=','...','..','<-','==','!=','<=','>=','&&','||',':=','->',
+    '<<=','>>=','..=','...','..','<-','==','!=','<=','>=','&&','||',':=','->','=>',
     '+=','-=','*=','/=','%=','&=','|=','^=','<<','>>','++','--'
 ]
 
@@ -142,13 +143,21 @@ class TypeRef(Node):
 class Program(Node):
     def __init__(self, decls: List[Node]): self.decls = decls
 
+class ImportDecl(Node):
+    def __init__(self, path: str, line: int = 0):
+        self.path, self.line = path, line
+
 class StructDecl(Node):
-    def __init__(self, name: str, fields: List[Tuple[str, TypeRef]], line: int = 0):
-        self.name, self.fields, self.line = name, fields, line
+    def __init__(self, name: str, fields: List[Tuple[str, TypeRef]], type_params: Optional[List[str]] = None, line: int = 0):
+        self.name, self.fields, self.type_params, self.line = name, fields, type_params or [], line
 
 class EnumDecl(Node):
     def __init__(self, name: str, variants: List[Tuple[str, List[TypeRef]]], line: int = 0):
         self.name, self.variants, self.line = name, variants, line
+
+class ClosureExpr(Node):
+    def __init__(self, params: List[Param], ret_type: Optional[TypeRef], body: Block, line: int = 0):
+        self.params, self.ret_type, self.body, self.line = params, ret_type, body, line
 
 class ConstDecl(Node):
     def __init__(self, name: str, init: Node, line: int = 0):
@@ -193,10 +202,12 @@ class ForStmt(Node):
         self.init, self.cond, self.post, self.body, self.line = init, cond, post, body, line
 
 class ForInStmt(Node):
-    def __init__(self, var: str, iterable: Node, body: Block, line: int = 0):
-        self.var, self.iterable, self.body, self.line = var, iterable, body, line
+    def __init__(self, var: str, iterable: Node, body: Block, line: int = 0, val_var: Optional[str] = None):
+        self.var, self.iterable, self.body, self.line, self.val_var = var, iterable, body, line, val_var
         self.kind: Optional[str] = None
         self.elem_type: Optional[Tuple] = None
+        self.key_type: Optional[Tuple] = None
+        self.val_type: Optional[Tuple] = None
         self.inclusive: bool = False
 
 class RangeExpr(Node):
@@ -286,6 +297,18 @@ class StructLit(Node):
 class TryExpr(Node):
     def __init__(self, expr: Node, line: int = 0): self.expr, self.line = expr, line
 
+class MatchCase(Node):
+    def __init__(self, pattern: Optional[Node], bindings: List[str], body: Block, is_default: bool = False, line: int = 0):
+        self.pattern, self.bindings, self.body, self.is_default, self.line = pattern, bindings, body, is_default, line
+
+class MatchStmt(Node):
+    def __init__(self, expr: Node, cases: List[MatchCase], line: int = 0):
+        self.expr, self.cases, self.line = expr, cases, line
+
+class InterfaceDecl(Node):
+    def __init__(self, name: str, methods: List[FuncDecl], line: int = 0):
+        self.name, self.methods, self.line = name, methods, line
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 3 — PARSER
@@ -322,6 +345,10 @@ class Parser:
         if t.kind == '[':
             self._eat('['); self._eat(']')
             return TypeRef('slice', [self.parse_type()], t.line)
+        if t.kind == 'weak':
+            self._eat('weak'); self._eat('[')
+            target_t = self.parse_type(); self._eat(']')
+            return TypeRef('weak', [target_t], t.line)
         if t.kind == 'map':
             self._eat('map'); self._eat('[')
             kt = self.parse_type(); self._eat(']')
@@ -346,9 +373,11 @@ class Parser:
     def parse_program(self) -> Program:
         decls: List[Node] = []
         while not self._at('EOF'):
-            if self._at('extern'):  decls.append(self.parse_extern())
+            if self._at('import'):  decls.append(self.parse_import())
+            elif self._at('extern'):  decls.append(self.parse_extern())
             elif self._at('struct'): decls.append(self.parse_struct())
             elif self._at('enum'):   decls.append(self.parse_enum())
+            elif self._at('interface'): decls.append(self.parse_interface())
             elif self._at('const'):  decls.append(self.parse_const())
             elif self._at('func'):   decls.append(self.parse_func())
             else:
@@ -356,10 +385,23 @@ class Parser:
                 raise AuraError(f"[Parser] {t.line}:{t.col}: unexpected declaration '{t.value or t.kind}'", t.line, t.col)
         return Program(decls)
 
+    def parse_import(self) -> ImportDecl:
+        ln = self._peek().line
+        self._eat('import')
+        path = self._eat('STRING').value
+        self._maybe(';')
+        return ImportDecl(path, ln)
+
     def parse_struct(self) -> StructDecl:
         ln = self._peek().line
         self._eat('struct')
         name = self._eat('IDENT').value
+        type_params = []
+        if self._at('['):
+            self._eat('[')
+            type_params.append(self._eat('IDENT').value)
+            while self._maybe(','): type_params.append(self._eat('IDENT').value)
+            self._eat(']')
         self._eat('{')
         fields = []
         while not self._at('}'):
@@ -368,7 +410,19 @@ class Parser:
             self._maybe(';')
             fields.append((fn, ft))
         self._eat('}')
-        return StructDecl(name, fields, ln)
+        return StructDecl(name, fields, type_params, ln)
+
+    def parse_interface(self) -> InterfaceDecl:
+        ln = self._peek().line
+        self._eat('interface')
+        name = self._eat('IDENT').value
+        self._eat('{')
+        methods = []
+        while not self._at('}'):
+            methods.append(self.parse_func(is_extern=True))
+            self._maybe(';')
+        self._eat('}')
+        return InterfaceDecl(name, methods, ln)
 
     def parse_enum(self) -> EnumDecl:
         ln = self._peek().line
@@ -459,6 +513,7 @@ class Parser:
         if t.kind == 'for':     return self.parse_for()
         if t.kind == 'spawn':   return self.parse_spawn()
         if t.kind == 'arena':   return self.parse_arena()
+        if t.kind == 'match':   return self.parse_match()
         if t.kind == '{':       return self.parse_block()
         if t.kind == 'break':   self._eat('break'); self._maybe(';'); return BreakStmt()
         if t.kind == 'continue':self._eat('continue'); self._maybe(';'); return ContinueStmt()
@@ -507,7 +562,15 @@ class Parser:
         ln = self._peek().line
         self._eat('for')
         if self._at('{'): return ForStmt(None, None, None, self.parse_block(), ln)
-        # for x in iter
+        # for x in iter OR for k, v in map
+        if self._at('IDENT') and self._peek(1).kind == ',':
+            k_var = self._eat('IDENT').value
+            self._eat(',')
+            v_var = self._eat('IDENT').value
+            self._eat('in')
+            iterable = self.parse_expr()
+            body = self.parse_block()
+            return ForInStmt(k_var, iterable, body, ln, val_var=v_var)
         if self._at('IDENT') and self._peek(1).kind == 'in':
             v = self._eat('IDENT').value
             self._eat('in')
@@ -556,6 +619,32 @@ class Parser:
         ln = self._peek().line
         self._eat('arena')
         return ArenaStmt(self.parse_block(), ln)
+
+    def parse_match(self) -> MatchStmt:
+        ln = self._peek().line
+        self._eat('match')
+        expr = self.parse_expr()
+        self._eat('{')
+        cases: List[MatchCase] = []
+        while not self._at('}'):
+            cln = self._peek().line
+            self._eat('case')
+            if self._at('IDENT') and self._peek().value == '_':
+                self._eat('IDENT')
+                self._maybe('=>')
+                body = self.parse_block()
+                cases.append(MatchCase(None, [], body, is_default=True, line=cln))
+            else:
+                pat = self.parse_expr()
+                bindings: List[str] = []
+                if isinstance(pat, CallExpr):
+                    for a in pat.args:
+                        if isinstance(a, Ident): bindings.append(a.name)
+                self._maybe('=>')
+                body = self.parse_block()
+                cases.append(MatchCase(pat, bindings, body, is_default=False, line=cln))
+        self._eat('}')
+        return MatchStmt(expr, cases, ln)
 
     # ---- expressions ----
     def parse_expr(self) -> Node: return self._assign()
@@ -677,7 +766,28 @@ class Parser:
         if t.kind == 'nil': self._eat('nil'); return NilLit(t.line)
         if t.kind == 'IDENT':
             self._eat('IDENT'); name = t.value
-            if self._at('{'):
+            if self._at('['):
+                nxt = self._peek(1)
+                nxt2 = self._peek(2)
+                if (nxt.kind in PRIMITIVES or nxt.kind == 'IDENT') and nxt2.kind in (']', ','):
+                    t_args = []
+                    self._eat('[')
+                    t_args.append(self.parse_type())
+                    while self._maybe(','): t_args.append(self.parse_type())
+                    self._eat(']')
+                    mono_s = f"{name}_{'_'.join(a.name for a in t_args)}"
+                    if self._at('{'):
+                        self._eat('{')
+                        inits = []
+                        while not self._at('}'):
+                            fn = self._eat('IDENT').value
+                            self._eat(':')
+                            inits.append((fn, self.parse_expr()))
+                            if not self._maybe(','): break
+                        self._eat('}')
+                        return StructLit(mono_s, inits, t.line)
+                    return Ident(mono_s, t.line)
+            if name not in PRIMITIVES and self._at('{'):
                 nxt = self._peek(1)
                 if nxt.kind == '}' or (nxt.kind == 'IDENT' and self._peek(2).kind == ':'):
                     self._eat('{')
@@ -707,14 +817,45 @@ class Parser:
         if t.kind == '[':
             ln = t.line
             self._eat('[')
+            if self._at(']'):
+                self._eat(']')
+                if self._at('IDENT') or self._peek().kind in PRIMITIVES or self._at('*') or self._at('['):
+                    elem_type = self.parse_type()
+                    if self._at('{'):
+                        self._eat('{')
+                        elems = []
+                        if not self._at('}'):
+                            elems.append(self.parse_expr())
+                            while self._maybe(','):
+                                if self._at('}'): break
+                                elems.append(self.parse_expr())
+                        self._eat('}')
+                        sl = SliceLit(elems, ln)
+                        sl._elem_type_ref = elem_type
+                        return sl
+                elems = []
+                return SliceLit(elems, ln)
             elems = []
-            if not self._at(']'):
+            elems.append(self.parse_expr())
+            while self._maybe(','):
+                if self._at(']'): break
                 elems.append(self.parse_expr())
-                while self._maybe(','):
-                    if self._at(']'): break
-                    elems.append(self.parse_expr())
             self._eat(']')
             return SliceLit(elems, ln)
+        if t.kind == '|':
+            ln = t.line
+            self._eat('|')
+            params = []
+            if not self._at('|'):
+                while True:
+                    pn = self._eat('IDENT').value
+                    pt = self.parse_type()
+                    params.append(Param(pn, pt))
+                    if not self._maybe(','): break
+            self._eat('|')
+            ret = None if self._at('{') else self.parse_type()
+            body = self.parse_block()
+            return ClosureExpr(params, ret, body, ln)
         if t.kind == '(':
             self._eat('('); e = self.parse_expr(); self._eat(')'); return e
         raise AuraError(f"[Parser] {t.line}:{t.col}: unexpected token '{t.value or t.kind}'", t.line, t.col)
@@ -740,6 +881,8 @@ class Analyzer:
         self.functions: Dict[str, FuncDecl] = {}
         self.extern_funcs: set = set()
         self.structs: Dict[str, Dict[str, Tuple]] = {}
+        self.generic_structs: Dict[str, StructDecl] = {}
+        self.closure_n: int = 0
 
         # Register standard library builtins
         builtins = [
@@ -753,6 +896,7 @@ class Analyzer:
             self.extern_funcs.add(f.name)
         self.struct_order: Dict[str, List[str]] = {}
         self.enums: Dict[str, Dict[str, List[Tuple]]] = {}
+        self.interfaces: Dict[str, Dict[str, FuncDecl]] = {}
         self.consts: Dict[str, Tuple] = {}
         self.globals = Scope()
         self.scope = self.globals
@@ -767,10 +911,23 @@ class Analyzer:
         if n in PRIMITIVES: return (n,)
         if n == 'ptr':   return ('ptr', self._resolve(t.args[0]))
         if n == 'chan':  return ('chan', self._resolve(t.args[0]))
+        if n == 'weak':  return ('weak', self._resolve(t.args[0]))
         if n == 'slice': return ('slice', self._resolve(t.args[0]))
         if n == 'map':   return ('map', self._resolve(t.args[0]), self._resolve(t.args[1]))
         if n == 'result':
             return ('result', self._resolve(t.args[0]), self._resolve(t.args[1]))
+        if n in self.interfaces: return ('interface', n)
+        if t.args and n in self.generic_structs:
+            mono_name = f"{n}_{'_'.join(a.name for a in t.args)}"
+            if mono_name not in self.structs:
+                gdecl = self.generic_structs[n]
+                subst = {tp: self._resolve(ta) for tp, ta in zip(gdecl.type_params, t.args)}
+                self.structs[mono_name] = {}
+                self.struct_order[mono_name] = [fn for fn, _ in gdecl.fields]
+                for fn, ft in gdecl.fields:
+                    res_t = subst.get(ft.name, self._resolve(ft))
+                    self.structs[mono_name][fn] = res_t
+            return ('struct', mono_name)
         if n in self.structs: return ('struct', n)
         if n in self.enums:   return ('enum', n)
         return ('opaque', n)
@@ -782,9 +939,12 @@ class Analyzer:
         return None
 
     def analyze(self, prog: Program):
-        # 1. Enums
+        # 1. Interfaces & Enums
         for d in prog.decls:
-            if isinstance(d, EnumDecl):
+            if isinstance(d, InterfaceDecl):
+                if d.name in self.interfaces: self._err(d.line, f"interface '{d.name}' already declared")
+                self.interfaces[d.name] = {m.name: m for m in d.methods}
+            elif isinstance(d, EnumDecl):
                 if d.name in self.enums: self._err(d.line, f"enum '{d.name}' already declared")
                 self.enums[d.name] = {}
                 for vn, vtypes in d.variants:
@@ -792,11 +952,14 @@ class Analyzer:
         # 2. Structs
         for d in prog.decls:
             if isinstance(d, StructDecl):
-                if d.name in self.structs: self._err(d.line, f"struct '{d.name}' already declared")
-                self.structs[d.name] = {}
-                self.struct_order[d.name] = [fn for fn, _ in d.fields]
+                if d.type_params:
+                    self.generic_structs[d.name] = d
+                else:
+                    if d.name in self.structs: self._err(d.line, f"struct '{d.name}' already declared")
+                    self.structs[d.name] = {}
+                    self.struct_order[d.name] = [fn for fn, _ in d.fields]
         for d in prog.decls:
-            if isinstance(d, StructDecl):
+            if isinstance(d, StructDecl) and not d.type_params:
                 for fn, ft in d.fields:
                     self.structs[d.name][fn] = self._resolve(ft)
         # 3. Functions
@@ -840,6 +1003,10 @@ class Analyzer:
 
     def _analyze_stmt(self, s: Node):
         if isinstance(s, VarDecl):
+            if s.type and isinstance(s.init, SliceLit):
+                dt = self._resolve(s.type)
+                if dt[0] == 'slice':
+                    s.init._elem_type = dt[1]
             it = self._analyze_expr(s.init) if s.init else None
             dt = self._resolve(s.type) if s.type else it
             if dt is None: self._err(s.line, f"'{s.name}' declared without type or initializer")
@@ -896,20 +1063,29 @@ class Analyzer:
 
         if isinstance(s, ForInStmt):
             self.scope = Scope(self.scope)
-            if isinstance(s.iterable, RangeExpr):
+            if s.val_var is not None:
+                it = self._analyze_expr(s.iterable)
+                if it[0] != 'map': self._err(s.line, f"'for k, v' expects map, got {it}")
+                s.kind = 'map'
+                s.key_type, s.val_type = it[1], it[2]
+                s._resolved_iter = it
+                self.scope.define(s.var, s.key_type, self._is_arc(s.key_type))
+                self.scope.define(s.val_var, s.val_type, self._is_arc(s.val_type))
+            elif isinstance(s.iterable, RangeExpr):
                 lt = self._analyze_expr(s.iterable.lo)
                 ht = self._analyze_expr(s.iterable.hi)
                 if lt != ('int',) or ht != ('int',):
                     self._err(s.line, f"range bounds must be int, got {lt}, {ht}")
                 s.kind, s.elem_type, s.inclusive = 'range', ('int',), s.iterable.inclusive
                 s._resolved_iter = ('range',)
+                self.scope.define(s.var, s.elem_type, self._is_arc(s.elem_type))
             else:
                 it = self._analyze_expr(s.iterable)
                 if it[0] == 'slice': s.kind, s.elem_type = 'slice', it[1]
                 elif it[0] == 'chan': s.kind, s.elem_type = 'chan', it[1]
                 else: self._err(s.line, f"cannot iterate over {it}")
                 s._resolved_iter = it
-            self.scope.define(s.var, s.elem_type, self._is_arc(s.elem_type))
+                self.scope.define(s.var, s.elem_type, self._is_arc(s.elem_type))
             self._analyze_block(s.body)
             self.scope = self.scope.parent
             return
@@ -926,6 +1102,42 @@ class Analyzer:
             self._analyze_expr(s.call)
             return
 
+        if isinstance(s, MatchStmt):
+            st = self._analyze_expr(s.expr)
+            if st[0] != 'enum': self._err(s.line, f"'match' expects enum, got {st}")
+            ename = st[1]
+            if ename not in self.enums: self._err(s.line, f"unknown enum '{ename}'")
+            for c in s.cases:
+                if c.is_default:
+                    self._analyze_block(c.body)
+                else:
+                    pat = c.pattern
+                    if isinstance(pat, CallExpr):
+                        vac = pat.func
+                    else:
+                        vac = pat
+                    if isinstance(vac, MemberAccess):
+                        vname = vac.field
+                    elif isinstance(vac, Ident):
+                        vname = vac.name
+                    else:
+                        self._err(c.line, "invalid match pattern")
+                    if vname not in self.enums[ename]:
+                        self._err(c.line, f"enum '{ename}' has no variant '{vname}'")
+                    vtypes = self.enums[ename][vname]
+                    tag_idx = list(self.enums[ename].keys()).index(vname)
+                    c._variant_name = vname
+                    c._variant_tag = tag_idx
+                    c._variant_types = vtypes
+                    if len(c.bindings) != len(vtypes):
+                        self._err(c.line, f"variant '{vname}' expects {len(vtypes)} bindings, got {len(c.bindings)}")
+                    self.scope = Scope(self.scope)
+                    for bname, vt in zip(c.bindings, vtypes):
+                        self.scope.define(bname, vt, self._is_arc(vt))
+                    self._analyze_block(c.body, new_scope=False)
+                    self.scope = self.scope.parent
+            return
+
         if isinstance(s, Block): self._analyze_block(s); return
         if isinstance(s, ExprStmt): self._analyze_expr(s.expr); return
         if isinstance(s, (BreakStmt, ContinueStmt)): return
@@ -934,7 +1146,19 @@ class Analyzer:
     def _is_int_type(self, t: Tuple) -> bool:
         return t[0] in ('int','u8','u16','u32','u64','i8','i16','i32','i64','byte','char')
 
-    def _type_eq(self, a: Tuple, b: Tuple) -> bool: return a == b
+    def _implements(self, st_name: str, if_name: str) -> bool:
+        if if_name not in self.interfaces or st_name not in self.structs: return False
+        if_methods = self.interfaces[if_name]
+        for mname in if_methods:
+            key = f"{st_name}.{mname}"
+            if key not in self.functions: return False
+        return True
+
+    def _type_eq(self, a: Tuple, b: Tuple) -> bool:
+        if a == b: return True
+        if a and b and a[0] == 'interface' and b[0] == 'struct':
+            return self._implements(b[1], a[1])
+        return False
 
     def _analyze_expr(self, e: Node) -> Tuple:
         if isinstance(e, IntLit):    return ('int',)
@@ -992,7 +1216,18 @@ class Analyzer:
             return tt
 
         if isinstance(e, CallExpr):
-            # Universal Method Resolution & Enum Construction
+            if isinstance(e.func, Ident):
+                hit = self.scope.lookup(e.func.name)
+                if hit and hit[0] and hit[0][0] == 'closure':
+                    c_pts = hit[0][1]
+                    c_rt = hit[0][2]
+                    for a in e.args: self._analyze_expr(a)
+                    e._is_closure_call = True
+                    e._closure_pts = c_pts
+                    e._closure_rt = c_rt
+                    return c_rt
+
+            # Interface Dynamic Dispatch & Method Resolution & Enum Construction
             if isinstance(e.func, MemberAccess):
                 if isinstance(e.func.obj, Ident) and e.func.obj.name in self.enums:
                     self._analyze_expr(e.func)
@@ -1004,7 +1239,7 @@ class Analyzer:
                             self._err(e.line, f"enum variant '{ename}.{vname}' expects {len(vtypes)} arguments, got {len(e.args)}")
                         for a, vt in zip(e.args, vtypes):
                             at = self._analyze_expr(a)
-                            if not self._type_eq(vt, at) and not (vt == ('float',) and at == ('int',)):
+                            if not self._type_eq(vt, at) and not (vt == ('float',) and at == ('int',)) and not (self._is_int_type(vt) and self._is_int_type(at)):
                                 self._err(e.line, f"type mismatch in '{ename}.{vname}': expected {vt}, got {at}")
                         e._is_enum_ctor_call = True
                         e._enum_name = ename
@@ -1012,6 +1247,21 @@ class Analyzer:
                         e._variant_tag = e.func._variant_tag
                         e._variant_types = vtypes
                         return ('enum', ename)
+
+                base_t = self._analyze_expr(e.func.obj)
+                if base_t[0] == 'interface':
+                    iname = base_t[1]
+                    mname = e.func.field
+                    if mname in self.interfaces[iname]:
+                        mdecl = self.interfaces[iname][mname]
+                        for a in e.args: self._analyze_expr(a)
+                        e._is_interface_call = True
+                        e._interface_name = iname
+                        e._interface_method = mname
+                        e._interface_recv = e.func.obj
+                        rt = self._resolve(mdecl.ret_type) if mdecl.ret_type else ('void',)
+                        e._resolved_ret = rt
+                        return rt
 
                 base_t = self._analyze_expr(e.func.obj)
                 st = None
@@ -1038,6 +1288,16 @@ class Analyzer:
                 et = self._analyze_expr(e.args[0]); e._intrinsic = 'err'; return ('result', ('void',), et)
             if name == 'close':
                 ct = self._analyze_expr(e.args[0]); e._intrinsic = 'close'; return ('void',)
+            if name == 'append':
+                if len(e.args) != 2: self._err(e.line, "'append' expects 2 arguments: append(slice, item)")
+                st = self._analyze_expr(e.args[0])
+                if st[0] != 'slice': self._err(e.line, f"'append' expects slice as first argument, got {st}")
+                it = self._analyze_expr(e.args[1])
+                if not self._type_eq(st[1], it) and not (st[1] == ('float',) and it == ('int',)):
+                    self._err(e.line, f"'append' item type mismatch: slice of {st[1]} vs item {it}")
+                e._intrinsic = 'append'
+                e._resolved_ret = st
+                return st
 
             fn = self.functions.get(name)
             if fn is None: self._err(e.line, f"call to undefined function '{name}'")
@@ -1129,12 +1389,21 @@ class Analyzer:
             self._err(e.line, f"cannot index type {ot}")
 
         if isinstance(e, SliceLit):
-            et = self._analyze_expr(e.elements[0])
-            for el in e.elements[1:]: self._analyze_expr(el)
+            if hasattr(e, '_elem_type_ref'):
+                et = self._resolve(e._elem_type_ref)
+            elif e.elements:
+                et = self._analyze_expr(e.elements[0])
+                for el in e.elements[1:]: self._analyze_expr(el)
+            else:
+                et = getattr(e, '_elem_type', ('int',))
             e._elem_type = et
             return ('slice', et)
 
         if isinstance(e, StructLit):
+            if e.name not in self.structs and '_' in e.name:
+                parts = e.name.rsplit('_', 1)
+                if parts[0] in self.generic_structs:
+                    self._resolve(TypeRef(parts[0], [TypeRef(parts[1])]))
             fmap = self.structs[e.name]
             for fn, fe in e.inits: self._analyze_expr(fe)
             e._resolved_type = ('struct', e.name)
@@ -1145,6 +1414,21 @@ class Analyzer:
             if t[0] != 'result': self._err(e.line, f"'?' operator requires result type, got {t}")
             e._resolved_type = t[1]
             return t[1]
+
+        if isinstance(e, ClosureExpr):
+            pts = [self._resolve(p.type) for p in e.params]
+            rt = self._resolve(e.ret_type) if e.ret_type else ('void',)
+            self.scope = Scope(self.scope)
+            for p, pt in zip(e.params, pts):
+                self.scope.define(p.name, pt, self._is_arc(pt))
+            old_ret = self.current_ret
+            self.current_ret = e.ret_type
+            self._analyze_block(e.body, new_scope=False)
+            self.current_ret = old_ret
+            self.scope = self.scope.parent
+            e._closure_pts = pts
+            e._closure_rt = rt
+            return ('closure', tuple(pts), rt)
 
         self._err(getattr(e,'line',0), f"unhandled expr {type(e).__name__}")
 
@@ -1181,7 +1465,7 @@ RUNTIME_HEADER = r'''
 #include <time.h>
 
 /* ───── ARC + Arenas ───── */
-typedef struct { _Atomic int64_t rc; int64_t flags; } AuraHeader;
+typedef struct { _Atomic int64_t strong_rc; _Atomic int64_t weak_rc; int64_t flags; } AuraHeader;
 
 typedef struct AuraArenaBlock { struct AuraArenaBlock* next; size_t used, cap; char data[]; } AuraArenaBlock;
 typedef struct { AuraArenaBlock* head; size_t default_block; } AuraArena;
@@ -1208,31 +1492,55 @@ static inline void aura_arena_free(AuraArena* a) {
 static inline void* aura_alloc(size_t size) {
     if (__aura_cur_arena) {
         AuraHeader* h = (AuraHeader*)aura_arena_alloc(__aura_cur_arena, size + sizeof(AuraHeader));
-        h->rc = 1; h->flags = 1;
+        h->strong_rc = 1; h->weak_rc = 0; h->flags = 1;
         return (char*)h + sizeof(AuraHeader);
     }
     AuraHeader* h = (AuraHeader*)malloc(size + sizeof(AuraHeader));
     if (!h) { fprintf(stderr, "aura: OOM\n"); abort(); }
-    h->rc = 1; h->flags = 0;
+    h->strong_rc = 1; h->weak_rc = 0; h->flags = 0;
     return (char*)h + sizeof(AuraHeader);
 }
 static inline void aura_retain(void* p) {
     if (!p) return; AuraHeader* h = (AuraHeader*)p - 1;
     if (h->flags & 1) return;
-    atomic_fetch_add_explicit(&h->rc, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&h->strong_rc, 1, memory_order_relaxed);
 }
 static inline void aura_release(void* p) {
     if (!p) return; AuraHeader* h = (AuraHeader*)p - 1;
     if (h->flags & 1) return;
-    if (atomic_fetch_sub_explicit(&h->rc, 1, memory_order_acq_rel) == 1) free(h);
+    if (atomic_fetch_sub_explicit(&h->strong_rc, 1, memory_order_acq_rel) == 1) {
+        if (atomic_load_explicit(&h->weak_rc, memory_order_acquire) == 0) free(h);
+    }
 }
 static inline void aura_retain_local(void* p) {
     if (!p) return; AuraHeader* h = (AuraHeader*)p - 1;
-    if (h->flags & 1) return; h->rc++;
+    if (h->flags & 1) return; h->strong_rc++;
 }
 static inline void aura_release_local(void* p) {
     if (!p) return; AuraHeader* h = (AuraHeader*)p - 1;
-    if (h->flags & 1) return; if (--h->rc == 0) free(h);
+    if (h->flags & 1) return;
+    if (--h->strong_rc == 0) {
+        if (h->weak_rc == 0) free(h);
+    }
+}
+static inline void aura_weak_retain(void* p) {
+    if (!p) return; AuraHeader* h = (AuraHeader*)p - 1;
+    if (h->flags & 1) return;
+    atomic_fetch_add_explicit(&h->weak_rc, 1, memory_order_relaxed);
+}
+static inline void aura_weak_release(void* p) {
+    if (!p) return; AuraHeader* h = (AuraHeader*)p - 1;
+    if (h->flags & 1) return;
+    if (atomic_fetch_sub_explicit(&h->weak_rc, 1, memory_order_acq_rel) == 1) {
+        if (atomic_load_explicit(&h->strong_rc, memory_order_acquire) == 0) free(h);
+    }
+}
+static inline void* aura_weak_lock(void* p) {
+    if (!p) return NULL; AuraHeader* h = (AuraHeader*)p - 1;
+    if (h->flags & 1) return p;
+    if (atomic_load_explicit(&h->strong_rc, memory_order_acquire) <= 0) return NULL;
+    aura_retain(p);
+    return p;
 }
 
 /* ───── Strings ───── */
@@ -1264,6 +1572,15 @@ static inline bool aura_string_eq(AuraString* a, AuraString* b) {
 
 /* ───── Slices ───── */
 typedef struct { void* data; int64_t len; int64_t cap; } AuraSlice;
+
+static inline AuraSlice aura_slice_grow(AuraSlice s, size_t elem_size) {
+    int64_t new_cap = s.cap < 8 ? 8 : s.cap * 2;
+    void* new_data = aura_alloc(new_cap * elem_size);
+    if (s.len > 0 && s.data) memcpy(new_data, s.data, s.len * elem_size);
+    s.data = new_data;
+    s.cap = new_cap;
+    return s;
+}
 
 /* ───── Hash Maps ───── */
 typedef struct { int64_t key; int64_t val; bool occupied; } AuraMapEntry;
@@ -1335,7 +1652,7 @@ static inline void aura_release_map(void* p) {
     if (!p) return;
     AuraHeader* h = (AuraHeader*)p - 1;
     if (h->flags & 1) return;
-    if (atomic_fetch_sub_explicit(&h->rc, 1, memory_order_acq_rel) == 1) {
+    if (atomic_fetch_sub_explicit(&h->strong_rc, 1, memory_order_acq_rel) == 1) {
         aura_map_free((AuraMap*)p); free(h);
     }
 }
@@ -1343,7 +1660,7 @@ static inline void aura_release_map_local(void* p) {
     if (!p) return;
     AuraHeader* h = (AuraHeader*)p - 1;
     if (h->flags & 1) return;
-    if (--h->rc == 0) {
+    if (--h->strong_rc == 0) {
         aura_map_free((AuraMap*)p); free(h);
     }
 }
@@ -1569,6 +1886,7 @@ class CCodegen:
         self.arena_n = 0
         self.spawn_n = 0
         self.spawn_helpers: List[str] = []
+        self.generated_vtables: set = set()
 
     def _w(self, s: str = ''): self.out.append('    ' * self.indent + s)
     def _fresh(self, p: str = 't') -> str: self.tmp += 1; return f"__{p}{self.tmp}"
@@ -1618,6 +1936,8 @@ class CCodegen:
         if k == 'map':    return 'AuraMap*'
         if k == 'struct': return 'Aura_' + t[1]
         if k == 'enum':   return 'Aura_' + t[1]
+        if k == 'interface': return 'Aura_' + t[1]
+        if k == 'closure': return 'void*'
         if k == 'result': return 'AuraResult'
         return 'void*'
 
@@ -1625,8 +1945,20 @@ class CCodegen:
         self._w('#include "aura_rt.h"')
         self._w()
         for d in prog.decls:
-            if isinstance(d, StructDecl): self._emit_struct(d)
-            elif isinstance(d, EnumDecl): self._emit_enum(d)
+            if isinstance(d, InterfaceDecl): self._emit_interface(d)
+        for sname, fields in self.an.structs.items():
+            self._w(f"typedef struct Aura_{sname} Aura_{sname};")
+            self._w(f"struct Aura_{sname} {{")
+            self.indent += 1
+            order = self.an.struct_order.get(sname, list(fields.keys()))
+            for fn in order:
+                ft = fields[fn]
+                self._w(f"{self.ctype(ft)} {fn};")
+            self.indent -= 1
+            self._w("};")
+            self._w()
+        for d in prog.decls:
+            if isinstance(d, EnumDecl): self._emit_enum(d)
         self._emit_result_type()
         for d in prog.decls:
             if isinstance(d, ConstDecl): self._emit_const(d)
@@ -1651,6 +1983,55 @@ class CCodegen:
         self.indent -= 1
         self._w("};")
         self._w()
+
+    def _emit_interface(self, d: InterfaceDecl):
+        self._w(f"typedef struct Aura_{d.name}_VTable Aura_{d.name}_VTable;")
+        self._w(f"typedef struct Aura_{d.name} Aura_{d.name};")
+        self._w(f"struct Aura_{d.name}_VTable {{")
+        self.indent += 1
+        for m in d.methods:
+            rt = self.ctype(self.an._resolve(m.ret_type)) if m.ret_type else 'void'
+            ps = ['void* receiver'] + [f"{self.ctype(self.an._resolve(p.type))} {p.name}" for p in m.params]
+            self._w(f"{rt} (*{m.name})({', '.join(ps)});")
+        self.indent -= 1
+        self._w("};")
+        self._w(f"struct Aura_{d.name} {{")
+        self.indent += 1
+        self._w("void* receiver;")
+        self._w(f"const Aura_{d.name}_VTable* vtable;")
+        self.indent -= 1
+        self._w("};")
+        self._w()
+
+    def _box_interface(self, expr_c: str, st_name: str, if_name: str) -> str:
+        vtable_name = f"__vt_{st_name}_{if_name}"
+        vtable_struct = f"Aura_{if_name}_VTable"
+        box_key = f"{st_name}_{if_name}"
+        if box_key not in self.generated_vtables:
+            self.generated_vtables.add(box_key)
+            if_decl_methods = self.an.interfaces[if_name]
+            vt_fields = []
+            trampolines = []
+            for mname, mdecl in if_decl_methods.items():
+                tramp_name = f"__tramp_{st_name}_{if_name}_{mname}"
+                rt = self.ctype(self.an._resolve(mdecl.ret_type)) if mdecl.ret_type else 'void'
+                ps = ['void* __r'] + [f"{self.ctype(self.an._resolve(p.type))} {p.name}" for p in mdecl.params]
+                fn_key = f"{st_name}.{mname}"
+                fn_node = self.an.functions[fn_key]
+                pass_args = [f"*((Aura_{st_name}*)__r)"] if (fn_node.receiver and fn_node.receiver.type.name != 'ptr') else [f"(Aura_{st_name}*)__r"]
+                pass_args += [p.name for p in mdecl.params]
+                fn_c_name = f"Aura_{st_name}_{mname}"
+                ret_kw = "return " if rt != 'void' else ""
+                tramp_code = f"static {rt} {tramp_name}({', '.join(ps)}) {{ {ret_kw}{fn_c_name}({', '.join(pass_args)}); }}"
+                trampolines.append(tramp_code)
+                vt_fields.append(f".{mname} = {tramp_name}")
+            vtable_def = f"static const {vtable_struct} {vtable_name} = {{ {', '.join(vt_fields)} }};"
+            self.spawn_helpers.append('\n'.join(trampolines + [vtable_def]))
+
+        tmp_r = self._fresh('recv')
+        return (f"({{ Aura_{st_name}* {tmp_r} = (Aura_{st_name}*)aura_alloc(sizeof(Aura_{st_name})); "
+                f"*{tmp_r} = {expr_c}; "
+                f"(Aura_{if_name}){{ .receiver = {tmp_r}, .vtable = &{vtable_name} }}; }})")
 
     def _emit_enum(self, d: EnumDecl):
         self._w(f"typedef struct Aura_{d.name} Aura_{d.name};")
@@ -1733,6 +2114,7 @@ class CCodegen:
             if c.strip(): self._w(f"{c};")
         elif isinstance(s, SpawnStmt): self._emit_spawn(s)
         elif isinstance(s, ArenaStmt): self._emit_arena(s)
+        elif isinstance(s, MatchStmt): self._emit_match(s)
         elif isinstance(s, BreakStmt): self._w('break;')
         elif isinstance(s, ContinueStmt): self._w('continue;')
 
@@ -1741,6 +2123,9 @@ class CCodegen:
         ct = self.ctype(t)
         if s.init is not None:
             ic = self._emit_expr(s.init)
+            if t[0] == 'interface' and self._infer(s.init)[0] == 'struct':
+                st_name = self._infer(s.init)[1]
+                ic = self._box_interface(ic, st_name, t[1])
             self._w(f"{ct} {s.name} = {ic};")
             if t[0] == 'string' and self._needs_retain(s.init):
                 self._w(f"aura_retain_local({s.name});")
@@ -1886,6 +2271,28 @@ class CCodegen:
             for x in s.body.stmts: self._emit_stmt(x)
             self._close_scope()
             self.indent -= 1; self._w('}')
+        elif s.kind == 'map':
+            m_var = self._fresh('m')
+            i_var = self._fresh('i')
+            kt = self.ctype(s.key_type)
+            vt = self.ctype(s.val_type)
+            self._w(f"AuraMap* {m_var} = {self._emit_expr(s.iterable)};")
+            self._w(f"if ({m_var}) {{")
+            self.indent += 1
+            self._w(f"for (size_t {i_var} = 0; {i_var} < {m_var}->cap; {i_var}++) {{")
+            self.indent += 1
+            self._w(f"if ({m_var}->entries[{i_var}].occupied) {{")
+            self.indent += 1
+            self._push_scope()
+            self._w(f"{kt} {s.var} = ({kt}){m_var}->entries[{i_var}].key;")
+            self._w(f"{vt} {s.val_var} = ({vt}){m_var}->entries[{i_var}].val;")
+            self._declare(s.var, s.key_type, self.an._is_arc(s.key_type))
+            self._declare(s.val_var, s.val_type, self.an._is_arc(s.val_type))
+            for x in s.body.stmts: self._emit_stmt(x)
+            self._close_scope()
+            self.indent -= 1; self._w("}")
+            self.indent -= 1; self._w("}")
+            self.indent -= 1; self._w("}")
         self.indent -= 1; self._w('}')
         self._close_scope()
 
@@ -1902,6 +2309,32 @@ class CCodegen:
         self._w(f"__aura_cur_arena = __prev_{n};")
         self._w(f"aura_arena_free(&__arena_{n});")
         self.indent -= 1; self._w('}')
+
+    def _emit_match(self, s: MatchStmt):
+        subj_c = self._emit_expr(s.expr)
+        st = self._infer(s.expr)
+        ename = st[1]
+        tmp_s = self._fresh('msg')
+        self._w(f"Aura_{ename} {tmp_s} = {subj_c};")
+        self._w(f"switch ({tmp_s}.tag) {{")
+        self.indent += 1
+        for c in s.cases:
+            if c.is_default:
+                self._w("default: {")
+            else:
+                self._w(f"case {c._variant_tag}: {{")
+            self.indent += 1
+            self._push_scope()
+            if not c.is_default:
+                for i, (bname, vt) in enumerate(zip(c.bindings, getattr(c, '_variant_types', []))):
+                    ct = self.ctype(vt)
+                    self._w(f"{ct} {bname} = {tmp_s}.data.{c._variant_name}._{i};")
+                    self._declare(bname, vt, self.an._is_arc(vt))
+            for x in c.body.stmts: self._emit_stmt(x)
+            self._w("break;")
+            self._close_scope()
+            self.indent -= 1; self._w("}")
+        self.indent -= 1; self._w("}")
 
     def _emit_spawn(self, s: SpawnStmt):
         call = s.call
@@ -2023,6 +2456,13 @@ class CCodegen:
             return f"({tgt_c} {op}= {val_c})"
 
         if isinstance(e, CallExpr):
+            if getattr(e, '_is_interface_call', False):
+                recv_c = self._emit_expr(e._interface_recv)
+                mname = e._interface_method
+                args_c = [self._emit_expr(a) for a in e.args]
+                all_args = [f"({recv_c}).receiver"] + args_c
+                return f"(({recv_c}).vtable->{mname}({', '.join(all_args)}))"
+
             if getattr(e, '_is_enum_ctor_call', False):
                 ename = e._enum_name
                 vname = e._variant_name
@@ -2056,6 +2496,17 @@ class CCodegen:
                 return f"((AuraResult){{ .ok = false, .err_code = (int64_t)({c}) }})"
             if intr == 'close':
                 return f"(aura_chan_close({self._emit_expr(e.args[0])}), (void)0)"
+            if intr == 'weak_lock':
+                return f"((void*)aura_weak_lock({self._emit_expr(e.args[0])}))"
+            if intr == 'append':
+                sl = self._emit_expr(e.args[0])
+                val = self._emit_expr(e.args[1])
+                ret_t = getattr(e, '_resolved_ret')
+                elem_t = ret_t[1]
+                ct = self.ctype(elem_t)
+                return (f"({{ AuraSlice __sl = {sl}; "
+                        f"if (__sl.len >= __sl.cap) __sl = aura_slice_grow(__sl, sizeof({ct})); "
+                        f"(({ct}*)__sl.data)[__sl.len++] = ({ct})({val}); __sl; }})")
 
             # Struct method calls with pointer-receiver auto-referencing
             if getattr(e, '_is_method', False):
@@ -2069,7 +2520,29 @@ class CCodegen:
                 return f"Aura_{st}_{mname}({', '.join(args_c)})"
 
             name = e.func.name
-            args_c = [self._emit_expr(a) for a in e.args]
+            fn_decl = self.an.functions.get(name)
+            args_c = []
+            if fn_decl and fn_decl.params:
+                for a, p in zip(e.args, fn_decl.params):
+                    ac = self._emit_expr(a)
+                    pt = self.an._resolve(p.type)
+                    at = self._infer(a)
+                    if pt[0] == 'interface' and at[0] == 'struct':
+                        ac = self._box_interface(ac, at[1], pt[1])
+                    args_c.append(ac)
+                if len(e.args) > len(fn_decl.params):
+                    for a in e.args[len(fn_decl.params):]:
+                        args_c.append(self._emit_expr(a))
+            else:
+                args_c = [self._emit_expr(a) for a in e.args]
+
+            ft = self._infer(e.func)
+            if ft[0] == 'closure':
+                c_pts = ft[1]
+                c_rt = ft[2]
+                crt = self.ctype(c_rt)
+                c_ps = ', '.join(self.ctype(pt) for pt in c_pts)
+                return f"((({crt}(*)({c_ps})){name})({', '.join(args_c)}))"
             return f"{name}({', '.join(args_c)})"
 
         if isinstance(e, ChanSend):
@@ -2128,9 +2601,15 @@ class CCodegen:
 
         if isinstance(e, SliceLit):
             et = getattr(e, '_elem_type', ('int',)); ct = self.ctype(et); n = len(e.elements)
+            if n == 0:
+                return f"((AuraSlice){{ .data = NULL, .len = 0, .cap = 0 }})"
             buf = self._fresh('buf'); sl = self._fresh('sl')
             stmts = [f"{ct}* {buf} = ({ct}*)aura_alloc(sizeof({ct}) * {n});"]
-            for i, el in enumerate(e.elements): stmts.append(f"{buf}[{i}] = {self._emit_expr(el)};")
+            for i, el in enumerate(e.elements):
+                el_c = self._emit_expr(el)
+                if et[0] == 'interface' and self._infer(el)[0] == 'struct':
+                    el_c = self._box_interface(el_c, self._infer(el)[1], et[1])
+                stmts.append(f"{buf}[{i}] = {el_c};")
             stmts.append(f"AuraSlice {sl} = {{ .data = {buf}, .len = {n}, .cap = {n} }};")
             return "({ " + " ".join(stmts) + f" {sl}; }})"
 
@@ -2138,7 +2617,17 @@ class CCodegen:
             ctype = 'Aura_' + e.name
             provided = {fn: fe for fn, fe in e.inits}
             order = self.an.struct_order.get(e.name, [])
-            parts = [f".{fn} = {self._emit_expr(provided[fn])}" for fn in order if fn in provided]
+            fmap = self.an.structs.get(e.name, {})
+            parts = []
+            for fn in order:
+                if fn in provided:
+                    fe = provided[fn]
+                    fe_c = self._emit_expr(fe)
+                    target_ft = fmap.get(fn)
+                    fe_t = self._infer(fe)
+                    if target_ft and target_ft[0] == 'interface' and fe_t[0] == 'struct':
+                        fe_c = self._box_interface(fe_c, fe_t[1], target_ft[1])
+                    parts.append(f".{fn} = {fe_c}")
             return f"(({ctype}){{ {', '.join(parts)} }})"
 
         if isinstance(e, TryExpr):
@@ -2149,6 +2638,34 @@ class CCodegen:
             return (f"({{ AuraResult {res} = {call_c}; "
                     f"if (!{res}.ok) {{ {unwind} return {res}; }} "
                     f"({ct}){res}.val.i; }})")
+
+        if isinstance(e, ClosureExpr):
+            self.tmp += 1
+            cid = self.tmp
+            c_name = f"__aura_closure_{cid}"
+            pts = getattr(e, '_closure_pts', [])
+            rt = getattr(e, '_closure_rt', ('void',))
+            crt = self.ctype(rt)
+            ps_str = ', '.join(f"{self.ctype(pt)} {p.name}" for p, pt in zip(e.params, pts))
+            if not ps_str: ps_str = 'void'
+
+            lines = [f"static {crt} {c_name}({ps_str}) {{"]
+            old_out = self.out
+            self.out = []
+            self.indent += 1
+            self._push_scope()
+            for p, pt in zip(e.params, pts):
+                self._declare(p.name, pt, self.an._is_arc(pt))
+            for st in e.body.stmts:
+                self._emit_stmt(st)
+            self._close_scope()
+            self.indent -= 1
+            body_lines = self.out
+            self.out = old_out
+            lines.extend(body_lines)
+            lines.append("}")
+            self.spawn_helpers.append('\n'.join(lines))
+            return f"(void*){c_name}"
 
         raise RuntimeError(f"codegen expr {type(e).__name__}")
 
@@ -2167,10 +2684,30 @@ def format_error(err: AuraError, src: str) -> str:
     return str(err)
 
 
-def compile_aura(src: str, emit_only: bool = False, output: Optional[str] = None) -> str:
+def resolve_imports(prog: Program, base_dir: str = '.', visited: Optional[set] = None) -> Program:
+    if visited is None: visited = set()
+    new_decls = []
+    for d in prog.decls:
+        if isinstance(d, ImportDecl):
+            imp_path = os.path.normpath(os.path.join(base_dir, d.path))
+            if imp_path not in visited:
+                visited.add(imp_path)
+                if os.path.exists(imp_path):
+                    with open(imp_path) as f: imp_src = f.read()
+                    imp_toks = Lexer(imp_src).tokenize()
+                    imp_prog = Parser(imp_toks).parse_program()
+                    resolved_imp = resolve_imports(imp_prog, os.path.dirname(imp_path), visited)
+                    new_decls.extend(resolved_imp.decls)
+        else:
+            new_decls.append(d)
+    return Program(new_decls)
+
+
+def compile_aura(src: str, emit_only: bool = False, output: Optional[str] = None, base_dir: str = '.') -> str:
     try:
         toks = Lexer(src).tokenize()
-        prog = Parser(toks).parse_program()
+        raw_prog = Parser(toks).parse_program()
+        prog = resolve_imports(raw_prog, base_dir)
         an = Analyzer()
         an.analyze(prog)
         gen = CCodegen(an)
@@ -2203,15 +2740,16 @@ def main():
     if len(sys.argv) < 3:
         print(__doc__); sys.exit(1)
     cmd, path = sys.argv[1], sys.argv[2]
+    base_dir = os.path.dirname(os.path.abspath(path))
     with open(path) as f: src = f.read()
     if cmd == 'emit':
-        print(compile_aura(src, emit_only=True)); return
+        print(compile_aura(src, emit_only=True, base_dir=base_dir)); return
     out = sys.argv[sys.argv.index('-o') + 1] if '-o' in sys.argv else None
     if cmd == 'compile':
-        b = compile_aura(src, output=out or os.path.splitext(path)[0])
+        b = compile_aura(src, output=out or os.path.splitext(path)[0], base_dir=base_dir)
         print(f"compiled -> {b}")
     elif cmd == 'run':
-        b = compile_aura(src, output=out or os.path.join(tempfile.gettempdir(), 'aura_run'))
+        b = compile_aura(src, output=out or os.path.join(tempfile.gettempdir(), 'aura_run'), base_dir=base_dir)
         r = subprocess.run([b]); sys.exit(r.returncode)
 
 

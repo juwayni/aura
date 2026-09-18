@@ -1,0 +1,19 @@
+struct Queue[T] {
+    items []T
+}
+
+func main() int {
+    let q = Queue[int]{ items: []int{ 10, 20, 30 } }
+    print(len(q.items))          // 3
+    print(q.items[0])            // 10
+    print(q.items[2])            // 30
+
+    let multiply = |x int| int {
+        return x * 5
+    }
+
+    let val = multiply(10)
+    print(val)                   // 50
+
+    return 0
+}

@@ -1,0 +1,8 @@
+struct Model {
+    name string
+    version int
+}
+
+func create_model(n string, v int) Model {
+    return Model{ name: n, version: v }
+}

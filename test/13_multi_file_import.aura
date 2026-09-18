@@ -1,0 +1,8 @@
+import "13_ui_models.aura"
+
+func main() int {
+    let m = create_model("Aura Framework", 5)
+    print(m.name)               // Aura Framework
+    print(m.version)            // 5
+    return 0
+}

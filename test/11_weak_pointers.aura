@@ -1,0 +1,14 @@
+struct Node {
+    id int
+    parent weak[Node]
+}
+
+func main() int {
+    let parent = Node{ id: 100, parent: nil }
+    let child = Node{ id: 200, parent: &parent }
+
+    print(parent.id)            // 100
+    print(child.id)             // 200
+
+    return 0
+}

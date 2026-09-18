@@ -1,0 +1,72 @@
+interface Widget {
+    func build() int
+}
+
+struct TextWidget {
+    content string
+}
+
+func (t TextWidget) build() int {
+    print("TextWidget:")
+    print(t.content)
+    return 0
+}
+
+struct ContainerWidget {
+    child Widget
+    width int
+}
+
+func (c ContainerWidget) build() int {
+    print("ContainerWidget width:")
+    print(c.width)
+    c.child.build()
+    return 0
+}
+
+struct ColumnWidget {
+    children []Widget
+}
+
+func (col ColumnWidget) build() int {
+    print("ColumnWidget rendering children:")
+    for w in col.children {
+        w.build()
+    }
+    return 0
+}
+
+enum Event {
+    Tap(int, int)
+    KeyPress(string)
+}
+
+func handle_event(e Event) int {
+    match e {
+        case Event.Tap(x, y) => {
+            print("Tap event at x, y:")
+            print(x)
+            print(y)
+        }
+        case Event.KeyPress(k) => {
+            print("KeyPress:")
+            print(k)
+        }
+    }
+    return 0
+}
+
+func main() int {
+    let text1 = TextWidget{ content: "Hello Aura UI!" }
+    let text2 = TextWidget{ content: "Subtext here" }
+
+    let container = ContainerWidget{ child: text2, width: 200 }
+    let col = ColumnWidget{ children: []Widget{ text1, container } }
+
+    col.build()
+
+    handle_event(Event.Tap(150, 300))
+    handle_event(Event.KeyPress("Enter"))
+
+    return 0
+}
