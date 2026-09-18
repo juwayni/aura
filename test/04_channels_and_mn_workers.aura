@@ -1,0 +1,19 @@
+func producer(ch chan int, n int) int {
+    for i = 0; i < n; i++ {
+        ch <- i * 10
+    }
+    close(ch)
+    return 0
+}
+
+func main() int {
+    let ch = make(chan int, 8)
+    spawn producer(ch, 5)
+
+    let total = 0
+    for v in ch {
+        total += v
+    }
+    print(total)               // 0 + 10 + 20 + 30 + 40 = 100
+    return 0
+}
