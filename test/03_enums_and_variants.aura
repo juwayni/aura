@@ -1,0 +1,23 @@
+enum Status {
+    Pending
+    Running
+    Success
+    Failed
+}
+
+enum Shape {
+    Circle(float)
+    Rect(float, float)
+}
+
+func main() int {
+    let s = Status.Running
+    print(s.tag)               // Variant tag 1
+
+    let c = Shape.Circle(5.0)
+    print(c.tag)               // Tag 0
+
+    let r = Shape.Rect(10.0, 20.0)
+    print(r.tag)               // Tag 1
+    return 0
+}
