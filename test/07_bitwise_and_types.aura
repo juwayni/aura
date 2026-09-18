@@ -1,0 +1,20 @@
+func main() int {
+    let a u32 = 0x0F0F
+    let b u32 = 0x00FF
+
+    let bit_and = a & b
+    let bit_or = a | b
+    let bit_xor = a ^ b
+    let shift_l = a << 4
+
+    print(bit_and)            // 0x000F = 15
+    print(bit_or)             // 0x0FFF = 4095
+    print(bit_xor)            // 0x0F00 = 3840
+    print(shift_l)            // 0xF0F0 = 61680
+
+    let s = "hello world"
+    let sub = s[0..5]
+    print(sub)                // hello
+
+    return 0
+}
