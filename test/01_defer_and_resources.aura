@@ -1,0 +1,29 @@
+func test_defer(fail bool) int {
+    print("entering function")
+    defer print("cleanup 1: executed last")
+    defer print("cleanup 2: executed second")
+    defer print("cleanup 3: executed first")
+
+    if fail {
+        print("triggering early return")
+        return -1
+    }
+
+    print("finishing normally")
+    return 0
+}
+
+func main() int {
+    test_defer(true)
+    print("---")
+    test_defer(false)
+
+    // Standard library file I/O test
+    let path = "/tmp/aura_test.txt"
+    let content = "Aura language file I/O works seamlessly!"
+    aura_write_file(path, content)
+    
+    let read_back = aura_read_file(path)
+    print(read_back)
+    return 0
+}
